@@ -67,8 +67,8 @@ class OptimizedConfig:
     # Change 'sub' to 'main' for full 4K resolution
     # Common patterns: Preview_01_main, Streaming/Channels/101, cam/realmonitor?channel=1&subtype=0
     CAMERA_URLS: List[str] = field(default_factory=lambda: [
-        'rtsp://admin:admin123@192.168.1.102:554/Preview_01_sub',   # Camera 0: Using sub stream (has network issues)
-        'rtsp://admin:admin123@192.168.1.103:554/Preview_01_main',  # Camera 1: MAIN = 4K (works fine)
+        'rtsp://admin:admin123@192.168.1.102:554/Preview_01_main',  # Camera 0: Main stream
+        'rtsp://admin:admin123@192.168.1.103:554/Preview_01_main',  # Camera 1: Main stream
         # CAMERAS 3 & 4 DISABLED - uncomment when needed:
         # 'rtsp://admin:admin123@192.168.1.104:554/Preview_01_main',
         # 'rtsp://admin:admin123@192.168.1.105:554/Preview_01_main',
@@ -105,16 +105,17 @@ class OptimizedConfig:
     
     # Multi-Embedding Profile Settings
     MAX_EMBEDDINGS_PER_PROFILE: int = 10  # Store up to N diverse embeddings per person
-    EMBEDDING_DIVERSITY_THRESHOLD: float = 0.15  # Min distance to add new embedding
+    EMBEDDING_DIVERSITY_THRESHOLD: float = 0.20  # Min distance to add new embedding (increased)
     
     # Hysteresis Thresholds (base values - will be adapted per camera)
-    BASE_HIGH_THRESHOLD: float = 0.72  # Base threshold to CREATE new ID
-    BASE_LOW_THRESHOLD: float = 0.52   # Base threshold to MAINTAIN existing ID
+    # HIGHER = stricter matching = fewer false positives
+    BASE_HIGH_THRESHOLD: float = 0.78  # Base threshold to CREATE new ID (stricter)
+    BASE_LOW_THRESHOLD: float = 0.58   # Base threshold to MAINTAIN existing ID (stricter)
     
     # Per-camera threshold adjustments (calibrated based on lighting)
     CAMERA_THRESHOLD_OFFSETS: Dict[int, float] = field(default_factory=lambda: {
         0: 0.0,   # Well-lit room
-        1: -0.03, # Darker room - lower thresholds
+        1: 0.0,   # Same lighting
         2: -0.05, # Very dark room
         3: 0.02,  # Bright room - higher thresholds
     })
@@ -129,12 +130,12 @@ class OptimizedConfig:
     MOMENTUM_ALPHA: float = 0.15
     
     # Temporal Consistency - Wait-and-See Buffer
-    MIN_FRAMES_TO_CONFIRM: int = 4
-    CANDIDATE_TIMEOUT: float = 3.0
+    MIN_FRAMES_TO_CONFIRM: int = 6  # Increased: need more frames to confirm (reduce false IDs)
+    CANDIDATE_TIMEOUT: float = 5.0  # Longer timeout for candidates
     
     # IOU Tracking
     IOU_THRESHOLD: float = 0.3
-    IOU_SIMILARITY_BOOST: float = 0.08
+    IOU_SIMILARITY_BOOST: float = 0.06  # Reduced IOU boost
     
     # Enhanced Preprocessing Settings
     CLAHE_CLIP_LIMIT: float = 3.0

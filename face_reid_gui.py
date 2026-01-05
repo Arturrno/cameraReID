@@ -5,7 +5,12 @@ A modern desktop application with:
 - 2x2 camera grid layout
 - Side panel with detected persons
 - Add client functionality
-- Multi-threaded AI processing
+- Multi-threaded AI processing with proper synchronization
+
+Architecture:
+- FrameGrabber threads: One per camera, grabs latest frame only (no buffer)
+- AIProcessor thread: Single thread batches all cameras for GPU efficiency
+- Synchronized display: All cameras show frames from same processing cycle
 
 Author: Senior Computer Vision Engineer
 Date: 2024
@@ -19,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import time
 import logging
+import threading
+from queue import Queue, Empty
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -67,137 +74,156 @@ class PersonInfo:
 
 
 # ============================================================================
-# Camera Processing Thread
+# Frame Grabber Thread - One per camera, only grabs latest frame
 # ============================================================================
 
-class CameraWorker(QThread):
+class FrameGrabber(threading.Thread):
     """
-    Worker thread for processing a single camera stream.
-    Emits signals with processed frames and detection info.
+    Lightweight thread that continuously grabs frames from a camera.
+    Always keeps only the LATEST frame - no buffer buildup.
     """
     
-    # Signals
-    frame_ready = pyqtSignal(int, np.ndarray)  # camera_id, processed_frame
-    detections_ready = pyqtSignal(int, list)   # camera_id, list of FaceDetection
-    error_occurred = pyqtSignal(int, str)      # camera_id, error_message
-    connection_status = pyqtSignal(int, bool)  # camera_id, is_connected
-    
-    def __init__(self, camera_id: int, url: str, config: Config,
-                 detector: RobustFaceDetector,
-                 embedding_engine: RobustFaceEmbeddingEngine,
-                 gallery: RobustFaceGallery,
-                 parent=None):
-        super().__init__(parent)
-        
+    def __init__(self, camera_id: int, url: str, config: Config):
+        super().__init__(daemon=True)
         self.camera_id = camera_id
         self.url = url
         self.config = config
-        self.detector = detector
-        self.embedding_engine = embedding_engine
-        self.gallery = gallery
         
         self._running = False
-        self._paused = False
-        self._mutex = QMutex()
+        self._connected = False
         self._cap: Optional[cv2.VideoCapture] = None
-        self._frame_count = 0
-        self._reconnect_attempts = 0
         
-        self.logger = logging.getLogger(f"CameraWorker-{camera_id}")
+        # Latest frame storage (thread-safe)
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_time: float = 0.0
+        
+        self.logger = logging.getLogger(f"FrameGrabber-{camera_id}")
     
-    def _connect(self) -> bool:
-        """Attempt to connect to the camera stream with hardware decoding."""
+    def connect(self) -> bool:
+        """Connect to the camera stream."""
         try:
             self.logger.info(f"Connecting to camera {self.camera_id}...")
             
             if self._cap is not None:
                 self._cap.release()
             
-            # Set environment variable for FFmpeg to use TCP transport
-            # This MUST be set before opening the capture
+            # Set TCP transport for reliability
             import os
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
             
-            # Open with FFmpeg backend
             self._cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             
-            # Minimal buffer to reduce latency
+            # Minimal buffer - we only want latest frame
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             self._cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)
-            self._cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)  # Shorter timeout
-            
-            # Enable hardware acceleration (DXVA on Windows)
+            self._cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
             self._cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
             
             if self._cap.isOpened():
-                # Log actual resolution being received
                 width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 fps = self._cap.get(cv2.CAP_PROP_FPS)
-                
-                # Check if HW acceleration is active
-                hw_accel = self._cap.get(cv2.CAP_PROP_HW_ACCELERATION)
-                hw_str = "HW" if hw_accel > 0 else "SW"
-                
-                self._reconnect_attempts = 0
-                self.connection_status.emit(self.camera_id, True)
-                self.logger.info(f"Camera {self.camera_id} connected: {width}x{height} @ {fps:.1f}fps ({hw_str} decode)")
+                self.logger.info(f"Camera {self.camera_id} connected: {width}x{height} @ {fps:.1f}fps")
+                self._connected = True
                 return True
             else:
-                self.connection_status.emit(self.camera_id, False)
                 self.logger.error(f"Failed to open camera {self.camera_id}")
+                self._connected = False
                 return False
                 
         except Exception as e:
-            self.logger.error(f"Connection error for camera {self.camera_id}: {e}")
-            self.connection_status.emit(self.camera_id, False)
+            self.logger.error(f"Connection error: {e}")
+            self._connected = False
             return False
     
-    def _process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[FaceDetection]]:
-        """Process a single frame through the AI pipeline."""
-        try:
-            # Update camera brightness statistics for adaptive preprocessing
-            self.embedding_engine.update_camera_stats(self.camera_id, frame)
+    def get_latest_frame(self) -> Tuple[Optional[np.ndarray], float]:
+        """Get the latest frame (thread-safe). Returns (frame, timestamp)."""
+        with self._frame_lock:
+            if self._latest_frame is not None:
+                return self._latest_frame.copy(), self._frame_time
+            return None, 0.0
+    
+    def is_connected(self) -> bool:
+        return self._connected
+    
+    def run(self):
+        """Continuously grab frames, keeping only the latest."""
+        self._running = True
+        reconnect_attempts = 0
+        
+        while self._running:
+            if not self._connected:
+                if reconnect_attempts >= self.config.MAX_RECONNECT_ATTEMPTS:
+                    self.logger.error("Max reconnection attempts reached")
+                    break
+                reconnect_attempts += 1
+                if self.connect():
+                    reconnect_attempts = 0
+                else:
+                    time.sleep(self.config.RECONNECT_DELAY)
+                continue
             
-            # Detect all faces
-            all_detections = self.detector.detect(frame)
-            
-            # Filter by size for ReID
-            reid_detections, small_detections = self.detector.filter_for_reid(all_detections)
-            
-            # Track list for IOU updates
-            current_tracks: List[Tuple[int, Tuple[int, int, int, int]]] = []
-            
-            if reid_detections:
-                # Extract embeddings (with enhanced preprocessing)
-                face_crops = [d.face_crop for d in reid_detections]
-                embeddings = self.embedding_engine.extract_embeddings_batch(face_crops, self.camera_id)
+            try:
+                ret, frame = self._cap.read()
                 
-                # Match and update gallery
-                for detection, embedding in zip(reid_detections, embeddings):
-                    detection.embedding = embedding
-                    person_id, is_confirmed = self.gallery.match_and_update(
-                        embedding, detection.bbox, self.camera_id
-                    )
-                    detection.person_id = person_id
-                    detection.is_confirmed = is_confirmed
+                if not ret or frame is None:
+                    self._connected = False
+                    continue
+                
+                # Skip corrupted frames
+                if frame.size == 0:
+                    continue
+                
+                # Store latest frame (overwrites previous - no buffer buildup!)
+                with self._frame_lock:
+                    self._latest_frame = frame
+                    self._frame_time = time.time()
                     
-                    # Add to track list for IOU memory
-                    if is_confirmed:
-                        current_tracks.append((person_id, detection.bbox))
-            
-            # Update IOU track memory
-            self.gallery.update_tracks(self.camera_id, current_tracks)
-            
-            # Draw detections on frame
-            processed_frame = self._draw_detections(frame, reid_detections, small_detections)
-            
-            return processed_frame, reid_detections
-            
-        except Exception as e:
-            self.logger.error(f"Frame processing error: {e}")
-            # Return original frame if processing fails
-            return frame, []
+            except Exception as e:
+                self.logger.error(f"Frame grab error: {e}")
+                self._connected = False
+        
+        if self._cap is not None:
+            self._cap.release()
+    
+    def stop(self):
+        self._running = False
+
+
+# ============================================================================
+# AI Processor Thread - Single thread for all cameras (GPU efficiency)
+# ============================================================================
+
+class AIProcessor(QThread):
+    """
+    Single AI processing thread that handles ALL cameras.
+    Batches frames together for maximum GPU utilization.
+    Emits synchronized results for all cameras.
+    """
+    
+    # Signals
+    frames_ready = pyqtSignal(dict)  # {camera_id: processed_frame}
+    detections_ready = pyqtSignal(int, list)  # camera_id, detections
+    connection_status = pyqtSignal(int, bool)  # camera_id, connected
+    
+    def __init__(self, grabbers: List[FrameGrabber], config: Config,
+                 detector: RobustFaceDetector,
+                 embedding_engine: RobustFaceEmbeddingEngine,
+                 gallery: RobustFaceGallery,
+                 parent=None):
+        super().__init__(parent)
+        
+        self.grabbers = grabbers
+        self.config = config
+        self.detector = detector
+        self.embedding_engine = embedding_engine
+        self.gallery = gallery
+        
+        self._running = False
+        self._frame_count = 0
+        
+        self.logger = logging.getLogger("AIProcessor")
     
     def _draw_detections(self, frame: np.ndarray, 
                          reid_detections: List[FaceDetection],
@@ -210,7 +236,6 @@ class CameraWorker(QThread):
         CANDIDATE_COLOR = (128, 128, 128)
         TOO_SMALL_COLOR = (100, 100, 100)
         
-        # Draw ReID detections
         for detection in reid_detections:
             x1, y1, x2, y2 = detection.bbox
             person_id = detection.person_id or 0
@@ -223,16 +248,10 @@ class CameraWorker(QThread):
                 label = f"ID: ? ({abs(person_id)})"
             
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            (label_w, label_h), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-            )
-            cv2.rectangle(frame, (x1, y1 - label_h - 10), 
-                         (x1 + label_w + 5, y1), color, -1)
-            cv2.putText(frame, label, (x1 + 2, y1 - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (x1, y1 - label_h - 10), (x1 + label_w + 5, y1), color, -1)
+            cv2.putText(frame, label, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Draw small detections
         for detection in small_detections:
             x1, y1, x2, y2 = detection.bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), TOO_SMALL_COLOR, 1)
@@ -240,85 +259,103 @@ class CameraWorker(QThread):
         return frame
     
     def run(self):
-        """Main processing loop."""
+        """Main processing loop - processes all cameras synchronously."""
         self._running = True
-        connected = False
+        self.logger.info("AI Processor started")
         
         while self._running:
-            # Check if paused
-            with QMutexLocker(self._mutex):
-                if self._paused:
-                    self.msleep(100)
-                    continue
+            self._frame_count += 1
             
-            # Try to connect if not connected
-            if not connected:
-                if self._reconnect_attempts >= self.config.MAX_RECONNECT_ATTEMPTS:
-                    self.error_occurred.emit(
-                        self.camera_id, 
-                        f"Max reconnection attempts ({self.config.MAX_RECONNECT_ATTEMPTS}) reached"
-                    )
-                    break
-                
-                self._reconnect_attempts += 1
-                connected = self._connect()
-                
-                if not connected:
-                    self.msleep(int(self.config.RECONNECT_DELAY * 1000))
-                    continue
+            # Skip frames for performance
+            if self._frame_count % self.config.FRAME_SKIP != 0:
+                time.sleep(0.01)  # Small sleep to not spin CPU
+                continue
             
-            try:
-                ret, frame = self._cap.read()
-                
-                if not ret or frame is None:
-                    self.logger.warning(f"Frame read failed for camera {self.camera_id}")
-                    connected = False
-                    self.connection_status.emit(self.camera_id, False)
+            # Collect latest frames from ALL cameras simultaneously
+            frames_to_process: Dict[int, np.ndarray] = {}
+            
+            for grabber in self.grabbers:
+                if grabber is None:
                     continue
+                    
+                frame, frame_time = grabber.get_latest_frame()
+                camera_id = grabber.camera_id
                 
-                # Validate frame (skip corrupted frames from H.264 decode errors)
-                if frame.size == 0 or np.mean(frame) < 1.0:
-                    # Likely a corrupted/black frame, skip it
-                    continue
+                # Emit connection status
+                self.connection_status.emit(camera_id, grabber.is_connected())
                 
-                self._frame_count += 1
+                if frame is not None:
+                    # Only process recent frames (drop if too old - sync!)
+                    if time.time() - frame_time < 0.5:  # Max 500ms old
+                        frames_to_process[camera_id] = frame
+            
+            if not frames_to_process:
+                time.sleep(0.01)
+                continue
+            
+            # Process all frames
+            processed_frames: Dict[int, np.ndarray] = {}
+            
+            # Process each camera separately to maintain proper per-camera preprocessing
+            for camera_id, frame in frames_to_process.items():
+                # Update camera stats
+                self.embedding_engine.update_camera_stats(camera_id, frame)
                 
-                # Skip frames for performance
-                if self._frame_count % self.config.FRAME_SKIP != 0:
-                    continue
+                # Detect faces
+                all_detections = self.detector.detect(frame)
+                reid_detections, small_detections = self.detector.filter_for_reid(all_detections)
                 
-                # Process frame
-                processed_frame, detections = self._process_frame(frame)
+                # Track list for IOU updates
+                current_tracks: List[Tuple[int, Tuple[int, int, int, int]]] = []
                 
-                # Emit signals
-                self.frame_ready.emit(self.camera_id, processed_frame)
-                if detections:
-                    self.detections_ready.emit(self.camera_id, detections)
+                if reid_detections:
+                    # Extract embeddings with CORRECT camera_id for preprocessing
+                    face_crops = [d.face_crop for d in reid_detections]
+                    embeddings = self.embedding_engine.extract_embeddings_batch(face_crops, camera_id)
+                    
+                    # Match and update gallery
+                    for detection, embedding in zip(reid_detections, embeddings):
+                        detection.embedding = embedding
+                        person_id, is_confirmed = self.gallery.match_and_update(
+                            embedding, detection.bbox, camera_id
+                        )
+                        detection.person_id = person_id
+                        detection.is_confirmed = is_confirmed
+                        
+                        # Add to track list for IOU memory
+                        if is_confirmed:
+                            current_tracks.append((person_id, detection.bbox))
                 
-            except Exception as e:
-                self.logger.error(f"Processing error for camera {self.camera_id}: {e}")
-                self.error_occurred.emit(self.camera_id, str(e))
-                connected = False
+                # Update IOU track memory
+                self.gallery.update_tracks(camera_id, current_tracks)
+                
+                # Draw and store
+                processed_frame = self._draw_detections(frame.copy(), reid_detections, small_detections)
+                processed_frames[camera_id] = processed_frame
+                
+                # Emit detections
+                if reid_detections:
+                    self.detections_ready.emit(camera_id, reid_detections)
+            
+            # Emit all processed frames at once (synchronized!)
+            self.frames_ready.emit(processed_frames)
+            
+            # Small sleep to control frame rate
+            time.sleep(0.01)
         
-        # Cleanup
-        if self._cap is not None:
-            self._cap.release()
-        
-        self.logger.info(f"Camera {self.camera_id} worker stopped")
+        self.logger.info("AI Processor stopped")
     
     def stop(self):
-        """Stop the worker thread."""
         self._running = False
-    
-    def pause(self):
-        """Pause processing."""
-        with QMutexLocker(self._mutex):
-            self._paused = True
-    
-    def resume(self):
-        """Resume processing."""
-        with QMutexLocker(self._mutex):
-            self._paused = False
+
+
+# ============================================================================
+# Legacy CameraWorker wrapper (for compatibility)
+# ============================================================================
+
+class CameraWorker:
+    """Compatibility wrapper - not used in new architecture."""
+    pass
 
 
 # ============================================================================
@@ -857,12 +894,15 @@ class MainWindow(QMainWindow):
         # Person name mapping
         self._person_names: Dict[int, Tuple[str, str]] = {}  # person_id -> (first, last)
         
-        # Camera workers
-        self.camera_workers: List[CameraWorker] = []
+        # Frame grabbers (one per camera)
+        self.frame_grabbers: List[Optional[FrameGrabber]] = []
+        
+        # AI Processor (single thread for all cameras)
+        self.ai_processor: Optional[AIProcessor] = None
         
         # Setup UI
         self._setup_ui()
-        self._setup_camera_workers()
+        self._setup_camera_system()
         
         # Setup update timer for stats
         self.stats_timer = QTimer(self)
@@ -907,42 +947,48 @@ class MainWindow(QMainWindow):
         self.sidebar.photo_uploaded.connect(self._on_photo_uploaded)
         main_layout.addWidget(self.sidebar)
     
-    def _setup_camera_workers(self):
-        """Create and start camera worker threads."""
-        # Only start workers for configured cameras
+    def _setup_camera_system(self):
+        """Create frame grabbers and AI processor with new architecture."""
+        # Create frame grabbers for each active camera
         for i in range(4):
             if i < self.num_active_cameras:
                 url = self.config.CAMERA_URLS[i]
-                worker = CameraWorker(
-                    camera_id=i,
-                    url=url,
-                    config=self.config,
-                    detector=self.detector,
-                    embedding_engine=self.embedding_engine,
-                    gallery=self.gallery
-                )
-                
-                # Connect signals
-                worker.frame_ready.connect(self._on_frame_ready)
-                worker.detections_ready.connect(self._on_detections_ready)
-                worker.connection_status.connect(self._on_connection_status)
-                worker.error_occurred.connect(self._on_error_occurred)
-                
-                self.camera_workers.append(worker)
-                worker.start()
-                
-                logger.info(f"Started camera worker {i}")
+                grabber = FrameGrabber(camera_id=i, url=url, config=self.config)
+                grabber.start()
+                self.frame_grabbers.append(grabber)
+                logger.info(f"Started frame grabber {i}")
             else:
-                # Mark disabled cameras
-                self.camera_workers.append(None)  # Placeholder
+                self.frame_grabbers.append(None)
                 self.camera_widgets[i].set_status("DISABLED")
                 logger.info(f"Camera {i} is disabled")
+        
+        # Give grabbers time to connect
+        time.sleep(0.5)
+        
+        # Create single AI processor for all cameras
+        active_grabbers = [g for g in self.frame_grabbers if g is not None]
+        self.ai_processor = AIProcessor(
+            grabbers=active_grabbers,
+            config=self.config,
+            detector=self.detector,
+            embedding_engine=self.embedding_engine,
+            gallery=self.gallery
+        )
+        
+        # Connect AI processor signals
+        self.ai_processor.frames_ready.connect(self._on_frames_ready)
+        self.ai_processor.detections_ready.connect(self._on_detections_ready)
+        self.ai_processor.connection_status.connect(self._on_connection_status)
+        
+        self.ai_processor.start()
+        logger.info("Started AI processor (batched processing for all cameras)")
     
-    @pyqtSlot(int, np.ndarray)
-    def _on_frame_ready(self, camera_id: int, frame: np.ndarray):
-        """Handle new frame from camera worker."""
-        if 0 <= camera_id < len(self.camera_widgets):
-            self.camera_widgets[camera_id].update_frame(frame)
+    @pyqtSlot(dict)
+    def _on_frames_ready(self, frames: Dict[int, np.ndarray]):
+        """Handle synchronized frames from all cameras."""
+        for camera_id, frame in frames.items():
+            if 0 <= camera_id < len(self.camera_widgets):
+                self.camera_widgets[camera_id].update_frame(frame)
     
     @pyqtSlot(int, list)
     def _on_detections_ready(self, camera_id: int, detections: List[FaceDetection]):
@@ -1078,15 +1124,20 @@ class MainWindow(QMainWindow):
         """Handle window close event."""
         logger.info("Closing application...")
         
-        # Stop all camera workers (skip None placeholders for disabled cameras)
-        for worker in self.camera_workers:
-            if worker is not None:
-                worker.stop()
+        # Stop AI processor
+        if self.ai_processor is not None:
+            self.ai_processor.stop()
+            self.ai_processor.wait(2000)
         
-        # Wait for workers to finish
-        for worker in self.camera_workers:
-            if worker is not None:
-                worker.wait(2000)
+        # Stop all frame grabbers
+        for grabber in self.frame_grabbers:
+            if grabber is not None:
+                grabber.stop()
+        
+        # Wait for grabbers to finish
+        for grabber in self.frame_grabbers:
+            if grabber is not None:
+                grabber.join(timeout=2.0)
         
         logger.info("Application closed")
         event.accept()
