@@ -46,8 +46,8 @@ class Config:
     """Central configuration for the Robust Face ReID system."""
     # RTSP Stream URLs
     CAMERA_URLS: List[str] = field(default_factory=lambda: [
-        'rtsp://admin:admin123@192.168.1.53:554/Preview_01_sub',
-        'rtsp://admin:admin123@192.168.1.54:554/Preview_01_sub',
+        'rtsp://admin:admin123@192.168.1.102:554/Preview_01_main',
+        'rtsp://admin:admin123@192.168.1.103:554/Preview_01_main',
     ])
     
     # Face Detection settings (MTCNN)

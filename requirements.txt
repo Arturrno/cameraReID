@@ -21,5 +21,8 @@ tensorboard>=2.15.0
 # Face Detection & Recognition
 facenet-pytorch>=2.5.3
 
+# GUI Framework
+PyQt6>=6.5.0
+
 # Utilities
 gdown>=4.7.0  # For downloading pretrained models
