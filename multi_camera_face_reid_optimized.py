@@ -27,6 +27,14 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
 from collections import OrderedDict, defaultdict
 from enum import Enum
+
+# Import known faces manager (optional, for reference database)
+try:
+    from known_faces_manager import KnownFacesManager, MatchResult
+    KNOWN_FACES_AVAILABLE = True
+except ImportError:
+    KNOWN_FACES_AVAILABLE = False
+    KnownFacesManager = None
 import time
 import logging
 import math
@@ -83,10 +91,10 @@ class OptimizedConfig:
         3: [2],      # Camera 3 is adjacent to Camera 2
     })
     
-    # Face Detection settings (MTCNN) - Optimized for long-distance security cameras
-    DETECTION_CONFIDENCE: float = 0.7  # Lowered for distant faces
-    MIN_FACE_SIZE: int = 12  # Minimum pixels for MTCNN to detect (very small for distance)
-    MIN_FACE_SIZE_FOR_REID: int = 20  # Minimum face size for ReID (lowered for distance)
+    # Face Detection settings (MTCNN) - STRICTER to avoid false positives
+    DETECTION_CONFIDENCE: float = 0.92  # HIGH - reject uncertain detections
+    MIN_FACE_SIZE: int = 30  # Minimum pixels for MTCNN (raised to reject noise)
+    MIN_FACE_SIZE_FOR_REID: int = 40  # Minimum face size for ReID (must be clear)
     
     # Detection scaling - downscale 4K for faster MTCNN, crop from original
     DETECTION_SCALE: float = 0.5  # Process detection at 50% resolution (e.g., 4K -> 1080p)
@@ -109,8 +117,9 @@ class OptimizedConfig:
     
     # Hysteresis Thresholds (base values - will be adapted per camera)
     # HIGHER = stricter matching = fewer false positives
-    BASE_HIGH_THRESHOLD: float = 0.78  # Base threshold to CREATE new ID (stricter)
-    BASE_LOW_THRESHOLD: float = 0.58   # Base threshold to MAINTAIN existing ID (stricter)
+    # These are now VERY strict to avoid false IDs
+    BASE_HIGH_THRESHOLD: float = 0.88  # VERY HIGH - only create new ID if nothing matches
+    BASE_LOW_THRESHOLD: float = 0.68   # Higher - need good match to maintain ID
     
     # Per-camera threshold adjustments (calibrated based on lighting)
     CAMERA_THRESHOLD_OFFSETS: Dict[int, float] = field(default_factory=lambda: {
@@ -130,8 +139,8 @@ class OptimizedConfig:
     MOMENTUM_ALPHA: float = 0.15
     
     # Temporal Consistency - Wait-and-See Buffer
-    MIN_FRAMES_TO_CONFIRM: int = 6  # Increased: need more frames to confirm (reduce false IDs)
-    CANDIDATE_TIMEOUT: float = 5.0  # Longer timeout for candidates
+    MIN_FRAMES_TO_CONFIRM: int = 15  # MANY frames needed - must be persistent
+    CANDIDATE_TIMEOUT: float = 3.0  # Shorter timeout - discard uncertain candidates faster
     
     # IOU Tracking
     IOU_THRESHOLD: float = 0.3
@@ -150,6 +159,11 @@ class OptimizedConfig:
     MAX_GALLERY_SIZE: int = 500
     GALLERY_CLEANUP_THRESHOLD: int = 50
     USE_CUDA_PREPROCESSING: bool = True  # Use CUDA if available
+    
+    # Known Faces Priority Mode
+    # When True: ONLY track/display known faces from database, ignore all unknowns
+    # When False: Track both known and unknown faces (but stricter on unknowns)
+    KNOWN_FACES_ONLY_MODE: bool = False  # Track unknown faces too
     
     # Stream settings
     RECONNECT_DELAY: float = 5.0
@@ -639,6 +653,7 @@ class OptimizedFaceEmbeddingEngine:
 class OptimizedFaceGallery:
     """
     Thread-safe face gallery with:
+    - Known faces database (reference photos for consistency)
     - Multi-embedding profiles (cluster of diverse embeddings per person)
     - Cosine similarity matching
     - Temporal decay and spatial priority
@@ -646,8 +661,15 @@ class OptimizedFaceGallery:
     - Cross-camera handover optimization
     """
     
-    def __init__(self, config: OptimizedConfig):
+    def __init__(self, config: OptimizedConfig, known_faces_manager = None):
         self.config = config
+        
+        # Known faces database (reference photos)
+        self._known_faces_manager = known_faces_manager
+        
+        # Mapping from known person_id (string) to gallery person_id (int)
+        self._known_to_gallery_id: Dict[str, int] = {}
+        self._gallery_to_known_id: Dict[int, str] = {}
         
         # Confirmed faces (global gallery)
         self._faces: OrderedDict[int, TrackedFace] = OrderedDict()
@@ -661,6 +683,10 @@ class OptimizedFaceGallery:
         self._lock = Lock()
         self._next_id = 1
         self._next_temp_id = -1
+        
+        # Statistics for known faces matching
+        self._known_match_count = 0
+        self._total_match_count = 0
     
     def _generate_id(self) -> int:
         """Generate a new permanent ID."""
@@ -673,6 +699,80 @@ class OptimizedFaceGallery:
         temp_id = self._next_temp_id
         self._next_temp_id -= 1
         return temp_id
+    
+    def set_known_faces_manager(self, manager):
+        """Set the known faces manager for reference database matching."""
+        with self._lock:
+            self._known_faces_manager = manager
+            logger.info("Known faces manager connected to gallery")
+    
+    def _match_against_known_faces(self, embedding: np.ndarray) -> Tuple[Optional[int], float, bool]:
+        """
+        Match embedding against known faces database.
+        
+        Returns:
+            Tuple of (gallery_person_id, similarity, is_known_match)
+            If matched, returns the gallery ID (creating one if needed)
+        """
+        if self._known_faces_manager is None:
+            return None, 0.0, False
+        
+        result = self._known_faces_manager.match(embedding)
+        
+        if not result.matched:
+            return None, result.similarity, False
+        
+        known_id = result.person_id
+        
+        # Check if we already have a gallery ID for this known person
+        if known_id in self._known_to_gallery_id:
+            gallery_id = self._known_to_gallery_id[known_id]
+            return gallery_id, result.similarity, True
+        
+        # Create a new gallery entry for this known person
+        gallery_id = self._generate_id()
+        
+        # Create profile with known person's embeddings
+        profile = EmbeddingProfile()
+        if result.person is not None:
+            for emb in result.person.embeddings:
+                profile.embeddings.append(emb)
+                profile.camera_sources.append(-1)  # -1 for reference photos
+                profile.timestamps.append(time.time())
+        
+        new_face = TrackedFace(
+            person_id=gallery_id,
+            profile=profile,
+            hit_count=1
+        )
+        self._faces[gallery_id] = new_face
+        
+        # Store mapping
+        self._known_to_gallery_id[known_id] = gallery_id
+        self._gallery_to_known_id[gallery_id] = known_id
+        
+        logger.info(f"Matched known person '{result.person.full_name}' ({known_id}) -> gallery ID {gallery_id} (sim={result.similarity:.3f})")
+        
+        return gallery_id, result.similarity, True
+    
+    def get_known_person_name(self, gallery_id: int) -> Optional[Tuple[str, str]]:
+        """Get the known person's name for a gallery ID, if available."""
+        if self._known_faces_manager is None:
+            return None
+        
+        known_id = self._gallery_to_known_id.get(gallery_id)
+        if known_id is None:
+            return None
+        
+        person = self._known_faces_manager.get_person(known_id)
+        if person is None:
+            return None
+        
+        return (person.first_name, person.last_name)
+    
+    def is_known_person(self, gallery_id: int) -> bool:
+        """Check if a gallery ID corresponds to a known person."""
+        return gallery_id in self._gallery_to_known_id
     
     def _get_adaptive_thresholds(self, camera_id: int) -> Tuple[float, float]:
         """Get camera-specific adaptive thresholds."""
@@ -841,21 +941,50 @@ class OptimizedFaceGallery:
     
     def match_and_update(self, embedding: np.ndarray, 
                          bbox: Tuple[int, int, int, int],
-                         camera_id: int) -> Tuple[int, bool]:
+                         camera_id: int) -> Tuple[Optional[int], bool]:
         """
         Match embedding against gallery and candidates.
         Uses multi-embedding profiles and adaptive thresholds.
         
+        PRIORITY ORDER:
+        1. Known faces database (reference photos) - HIGHEST PRIORITY
+        2. Confirmed gallery (dynamic faces) - ONLY if KNOWN_FACES_ONLY_MODE is False
+        3. Candidates (wait-and-see buffer) - ONLY if KNOWN_FACES_ONLY_MODE is False
+        4. Create new candidate - ONLY if KNOWN_FACES_ONLY_MODE is False
+        
         Returns:
             Tuple of (person_id, is_confirmed)
+            Returns (None, False) if in KNOWN_FACES_ONLY_MODE and face is not in database
         """
         with self._lock:
             self._cleanup_expired_candidates()
+            self._total_match_count += 1
             
             # Get camera-specific thresholds
             high_threshold, low_threshold = self._get_adaptive_thresholds(camera_id)
             
-            # 1. Try to match with confirmed gallery
+            # 0. FIRST: Try to match with KNOWN FACES DATABASE (reference photos)
+            # This provides consistency by matching against enrolled reference photos
+            known_match_id, known_sim, is_known = self._match_against_known_faces(embedding)
+            
+            if is_known and known_match_id is not None:
+                self._known_match_count += 1
+                # Update the face in gallery
+                if known_match_id in self._faces:
+                    face = self._faces[known_match_id]
+                    face.update(embedding, camera_id, bbox, self.config)
+                    self._faces.move_to_end(known_match_id)
+                logger.debug(f"Matched KNOWN person ID {known_match_id} (sim={known_sim:.3f})")
+                return known_match_id, True
+            
+            # If KNOWN_FACES_ONLY_MODE is enabled, don't track unknown faces at all
+            if self.config.KNOWN_FACES_ONLY_MODE:
+                logger.debug(f"Unknown face ignored (KNOWN_FACES_ONLY_MODE=True, best_sim={known_sim:.3f})")
+                return None, False
+            
+            # === Below only runs if KNOWN_FACES_ONLY_MODE is False ===
+            
+            # 1. Try to match with confirmed gallery (dynamic faces)
             gallery_match_id, gallery_sim = self._find_gallery_match(embedding, bbox, camera_id)
             
             if gallery_match_id is not None and gallery_sim >= low_threshold:
@@ -938,11 +1067,20 @@ class OptimizedFaceGallery:
             total_embeddings = sum(
                 len(face.profile.embeddings) for face in self._faces.values()
             )
+            
+            known_faces_stats = {}
+            if self._known_faces_manager is not None:
+                known_faces_stats = self._known_faces_manager.get_stats()
+            
             return {
                 'confirmed_faces': len(self._faces),
                 'candidates': len(self._candidates),
                 'total_embeddings': total_embeddings,
-                'next_id': self._next_id
+                'next_id': self._next_id,
+                'known_persons': known_faces_stats.get('num_persons', 0),
+                'known_matches': self._known_match_count,
+                'total_matches': self._total_match_count,
+                'known_match_rate': self._known_match_count / max(1, self._total_match_count)
             }
     
     def get_person_info(self, person_id: int) -> Optional[Dict]:
@@ -950,13 +1088,20 @@ class OptimizedFaceGallery:
         with self._lock:
             if person_id in self._faces:
                 face = self._faces[person_id]
+                
+                # Check if this is a known person
+                known_name = self.get_known_person_name(person_id)
+                is_known = self.is_known_person(person_id)
+                
                 return {
                     'person_id': person_id,
                     'hit_count': face.hit_count,
                     'last_camera': face.last_camera_id,
                     'last_seen': face.last_seen,
                     'embedding_count': len(face.profile.embeddings),
-                    'cameras_seen': list(set(face.profile.camera_sources))
+                    'cameras_seen': list(set(face.profile.camera_sources)),
+                    'is_known': is_known,
+                    'known_name': known_name
                 }
             return None
 
@@ -978,13 +1123,13 @@ class RobustFaceDetector:
         # Since we scale down for detection, we need smaller min_face_size
         effective_min_face = max(8, int(config.MIN_FACE_SIZE * config.DETECTION_SCALE))
         
-        # MTCNN with aggressive settings for small/distant faces
+        # MTCNN with STRICT settings to avoid false positives
         self.mtcnn = MTCNN(
             image_size=config.FACE_CROP_SIZE,
             margin=0,  # We handle margin manually
             min_face_size=effective_min_face,  # Scaled for detection resolution
-            thresholds=[0.4, 0.5, 0.5],  # Lower thresholds for distant faces
-            factor=0.65,  # Smaller factor = more pyramid levels = better small face detection
+            thresholds=[0.7, 0.8, 0.85],  # HIGH thresholds - reject uncertain detections
+            factor=0.707,  # Standard factor
             keep_all=True,
             device=self.device
         )
